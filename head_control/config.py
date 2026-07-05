@@ -550,3 +550,59 @@ GT_BLUE_RADIUS = 0.02                              # [m]
 GT_BLUE_HEIGHT = 0.15                              # [m]
 # GT_TABLE_TOP_Z intentionally NOT duplicated here — use TABLE_TOP_Z_WORLD
 # (§2 above), which is the same 0.70m derived from the same SDF pose.
+
+# =============================================================================
+# 14. OBB / MEMORY-TRACKING ESTIMATOR  (ported architecture, EXPERIMENT — OFF
+#     by default; see obb_detector.py / obb_tracker.py)
+# =============================================================================
+# PROVENANCE: a colleague's ROS2/C++ `tabletop_perception_node` (PCL-based)
+# uses a DIFFERENT estimation philosophy than object_detector.py's cylinder
+# fit: instead of assuming "upright cylinder" and fitting a circle, it makes
+# NO shape assumption at all — per Euclidean cluster it computes a Z-LOCKED
+# 2D-PCA oriented bounding box (flatten to z=0, eigendecompose the 2x2 XY
+# covariance, keep the vertical axis pinned to world +Z, take the AABB of the
+# cluster in that rotated frame), then fuses across frames with a
+# position-matched, GROW-ONLY-dimension, frames-unseen-persistence tracker
+# (matches, but does not replace, `object_tracker.ObjectTracker`'s EMA
+# policy — see that module's docstring for why EMA was chosen there).
+#
+# This is ported here as an ADDITIONAL, INDEPENDENTLY-TOGGLEABLE estimator
+# (`obb_detector.py` + `obb_tracker.py`), run ALONGSIDE — never instead of —
+# the existing rim-extraction/Hyper-fit cylinder pipeline (object_detector.py,
+# §5.10 in context.md), which remains the primary/trusted path. It reuses
+# THIS project's own RANSAC plane (table_segmenter.py) and voxel-downsample +
+# Euclidean clustering (object_detector.ObjectDetector's static helpers) —
+# only the per-cluster SHAPE FIT and the fusion policy are new, avoiding a
+# second independent (and potentially divergent) implementation of either.
+#
+# HONEST CAVEATS (read before treating this as "the fix" for the cylinder
+# pose/radius error — it is NOT a drop-in fix, see context.md for the full
+# discussion):
+#   1. A generic OBB has no notion of "radius" — for a cylinder viewed
+#      top-down (a near-circular footprint) the AABB's dimensions are simply
+#      the min/max EXTENT of whatever the camera saw, which is a max-minus-min
+#      statistic. Like `z_max` (see object_detector.py's height-bias fix,
+#      §5.10), max-minus-min is SYSTEMATICALLY BIASED LARGE under noise — the
+#      opposite bias direction from the OLD disk-interior circle-fit bug this
+#      project already root-caused and fixed. This estimator does not inherit
+#      either the old bug OR its fix; it has its own, different bias profile.
+#   2. PCA orientation is ill-defined on a near-circular cluster (eigenvalues
+#      close to equal): the fitted "in-plane" axes can rotate arbitrarily
+#      frame-to-frame with no physical meaning for an upright cylinder. Since
+#      the tracker's dimension fusion is GROW-ONLY IN THE BOX'S OWN LOCAL
+#      AXES, an orientation flip between frames can inflate a dimension by
+#      taking `max()` across two frames that do not actually refer to the
+#      same physical axis. Not fixed here — it is an inherent property of
+#      the ported architecture, faithfully reproduced, not patched.
+#   3. Ground-truth constants (`GT_RED_CENTER` etc., §13) are NEVER read by
+#      this estimator — matches the project's standing no-fudge-factor rule.
+ENABLE_OBB_ESTIMATOR = False   # master switch; OFF so main_head.py's default
+                                # behaviour/output is completely unchanged
+OBB_MATCH_DIST = 0.15          # [m] nearest-track association radius (ported
+                                # verbatim from MATCHING_DISTANCE_THRESHOLD)
+OBB_MAX_UNSEEN_FRAMES = 10     # frames a track survives unmatched (ported
+                                # verbatim; at this project's own
+                                # PERCEPTION_RATE_HZ=5.0 this is ALSO ~2s,
+                                # same real-world timeout as the original)
+OBB_TARGET_PADDING = 0.005     # [m] visual box padding, non-obstacle tracks
+OBB_OBSTACLE_PADDING = 0.005   # [m] visual box padding, obstacle-classified tracks
