@@ -46,6 +46,7 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
 from sensor_msgs.msg import PointCloud2
 from visualization_msgs.msg import MarkerArray
+from geometry_msgs.msg import PoseStamped
 from scipy.spatial.transform import Rotation as Rot
 
 import tf2_ros
@@ -60,6 +61,7 @@ from triago_control.head_control.visualization import (
     PerceptionVisualizer,
     make_pointcloud2,
 )
+from triago_control.head_control.obb_detector import rotation_matrix_to_quaternion
 
 
 class HeadPerceptionNode(Node):
@@ -92,6 +94,18 @@ class HeadPerceptionNode(Node):
         # 0=HOLD 1=APPROACH 2=RETREAT 3=INIT.
         self.pub_view = self.create_publisher(
             Float64MultiArray, "/head_perception/view_debug", 10
+        )
+        # --- OBB / memory-tracking estimator (config.py §14, EXPERIMENT) ---
+        # Ported topic contract, mirroring the colleague's C++ node
+        # (perception/bounding_boxes, perception/target_pose) but under this
+        # project's own /head_perception namespace. Publishers are created
+        # unconditionally (cheap, no subscribers = no cost) but only ever
+        # carry data when cfg.ENABLE_OBB_ESTIMATOR is True.
+        self.pub_obb_boxes = self.create_publisher(
+            MarkerArray, "/head_perception/obb_bounding_boxes", 1
+        )
+        self.pub_obb_target_pose = self.create_publisher(
+            PoseStamped, "/head_perception/obb_target_pose", 10
         )
 
         # --- TF2 (correct camera pose at the depth frame's timestamp) --
@@ -182,6 +196,20 @@ class HeadPerceptionNode(Node):
                 "# Compare the [BIAS-VS-RANGE] intercept against a normal run to  #\n"
                 "# see whether this changes anything. Set the flag back to False #\n"
                 "# to return to the standard TF-derived pipeline.                 #\n"
+                "##################################################################")
+        if cfg.ENABLE_OBB_ESTIMATOR:
+            self.get_logger().warn(
+                "\n"
+                "##################################################################\n"
+                "# EXPERIMENT ACTIVE: cfg.ENABLE_OBB_ESTIMATOR = True              #\n"
+                "# A second, independent shape-free PCA/OBB estimator (ported from #\n"
+                "# a colleague's C++ tabletop_perception_node, see config.py §14) #\n"
+                "# now runs ALONGSIDE the primary cylinder pipeline, on the same  #\n"
+                "# above-plane clusters. It publishes its own topics              #\n"
+                "# (/head_perception/obb_bounding_boxes,                          #\n"
+                "#  /head_perception/obb_target_pose) and does NOT alter           #\n"
+                "# result.objects / the primary cylinder output in any way. See   #\n"
+                "# config.py §14 for its different bias profile / known caveats.  #\n"
                 "##################################################################")
         if cfg.ENABLE_MANUAL_MOUNT_TF:
             self.get_logger().warn(
@@ -318,6 +346,27 @@ class HeadPerceptionNode(Node):
         # --- Publish markers -------------------------------------------
         markers = self.viz.build(result, self.current_target, t_cam_base, stamp)
         self.pub_markers.publish(markers)
+
+        # --- OBB / memory-tracking estimator (config.py §14, EXPERIMENT) ---
+        # No-op (empty result.obb_tracks) when cfg.ENABLE_OBB_ESTIMATOR=False,
+        # so this branch is a harmless empty-array publish by default.
+        if cfg.ENABLE_OBB_ESTIMATOR:
+            obb_markers = self.viz.build_obb(result, stamp)
+            self.pub_obb_boxes.publish(obb_markers)
+            if result.obb_primary_target is not None:
+                t = result.obb_primary_target
+                q = rotation_matrix_to_quaternion(t.rotation)
+                pose_msg = PoseStamped()
+                pose_msg.header.frame_id = cfg.BASE_FRAME
+                pose_msg.header.stamp = stamp
+                pose_msg.pose.position.x = float(t.position[0])
+                pose_msg.pose.position.y = float(t.position[1])
+                pose_msg.pose.position.z = float(t.position[2])
+                pose_msg.pose.orientation.x = float(q[0])
+                pose_msg.pose.orientation.y = float(q[1])
+                pose_msg.pose.orientation.z = float(q[2])
+                pose_msg.pose.orientation.w = float(q[3])
+                self.pub_obb_target_pose.publish(pose_msg)
 
         # --- Publish scalar telemetry for the plotter ------------------
         tel = Float64MultiArray()

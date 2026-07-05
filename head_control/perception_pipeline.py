@@ -25,6 +25,8 @@ from triago_control.head_control.table_segmenter import TableSegmenter
 from triago_control.head_control.object_detector import ObjectDetector, DetectedObject
 from triago_control.head_control.voxel_map import VoxelMap
 from triago_control.head_control.object_tracker import ObjectTracker
+from triago_control.head_control.obb_detector import fit_oriented_box
+from triago_control.head_control.obb_tracker import ObbTracker
 
 
 @dataclass
@@ -47,6 +49,11 @@ class PerceptionResult:
     n_raw: int = 0
     map_size: int = 0                       # voxels in the fused map (0 if off)
     proc_ms: float = 0.0
+    # --- OBB / memory-tracking estimator (config.py §14, OFF by default) ---
+    # Populated only when cfg.ENABLE_OBB_ESTIMATOR is True; always empty/None
+    # otherwise, so the default pipeline output is completely unaffected.
+    obb_tracks: list = field(default_factory=list)     # list[OBBTrack]
+    obb_primary_target: object = None                  # OBBTrack or None
 
 
 class PerceptionPipeline:
@@ -56,6 +63,9 @@ class PerceptionPipeline:
         self.tracker = ObjectTracker()     # object-level temporal fusion
         self._tracked = []                  # (legacy, unused)
         self.voxel_map = VoxelMap() if cfg.ENABLE_ACCUMULATION else None
+        # OBB / memory-tracking estimator (config.py §14) — independent,
+        # OFF-by-default, ported estimator run alongside the cylinder pipeline.
+        self.obb_tracker = ObbTracker() if cfg.ENABLE_OBB_ESTIMATOR else None
 
     # ------------------------------------------------------------------ #
     # Frame transform                                                     #
@@ -165,6 +175,25 @@ class PerceptionPipeline:
         # 5. Object-level temporal fusion (grow-only dims + persistence). Only
         # fuse when the head is settled so motion never corrupts the estimate.
         res.objects = self.tracker.update(detections, allow_update=allow_track_update)
+
+        # 6. OBB / memory-tracking estimator (config.py §14) — an independent,
+        # shape-free estimator run on the SAME above-plane points/clusters,
+        # gated OFF by default so the primary cylinder pipeline's output
+        # (res.objects above) is completely unaffected either way. Reuses
+        # ObjectDetector's own voxel-downsample + Euclidean clustering (single
+        # source of truth for clustering, per this project's convention)
+        # rather than re-implementing PCL's VoxelGrid + EuclideanClusterExtraction
+        # a second time.
+        if self.obb_tracker is not None:
+            pts_ds, cols_ds = ObjectDetector._voxel_downsample(above_pts, above_cols, cfg.VOXEL_SIZE)
+            clusters = ObjectDetector._euclidean_cluster(pts_ds)
+            boxes = []
+            for idx in clusters:
+                box = fit_oriented_box(pts_ds[idx], cols_ds[idx])
+                if box is not None:
+                    boxes.append(box)
+            table_surface_z = plane.height
+            res.obb_tracks, res.obb_primary_target = self.obb_tracker.update(boxes, table_surface_z)
 
         res.proc_ms = (time.perf_counter() - t0) * 1e3
         return res
